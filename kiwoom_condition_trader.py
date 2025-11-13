@@ -1,3 +1,14 @@
+"""Kiwoom OpenAPI+ condition-based automated trading utilities.
+
+This module wires up condition search feeds, order management, and risk
+controls to provide a paper-trading environment for 전략 실험. The core class,
+``ConditionAutoTrader``, coordinates login, TR requests, 실시간 이벤트, 분할 체결,
+트레일링 손익 관리, 로그/차트 기록, 그리고 간단한 피드백 루프까지 수행한다.
+
+구성은 JSON 파일을 통해 외부에서 조정하며, 각 기능은 키움 OpenAPI+ 공식
+문서(2023-09-18 배포본)를 기반으로 구현되었다.
+"""
+
 import csv
 import importlib
 import json
@@ -19,6 +30,8 @@ from PyQt5.QAxContainer import QAxWidget
 
 @dataclass
 class OrderConfig:
+    """Configuration values controlling account info, budgets, and risk rules."""
+
     total_budget: int = 40_000_000  # KRW
     max_positions: int = 4
     condition_name: str = ""
@@ -48,6 +61,8 @@ class OrderConfig:
 
 @dataclass
 class PositionInfo:
+    """Runtime snapshot for a single open position."""
+
     code: str
     entry_price: float
     quantity: int
@@ -72,6 +87,8 @@ class PositionInfo:
 
 @dataclass
 class OrderStatus:
+    """Tracks progress of an outstanding limit/market order."""
+
     code: str
     quantity: int
     placed_at: datetime
@@ -86,8 +103,18 @@ class OrderStatus:
 
 
 class ConditionAutoTrader(QAxWidget):
-    """
-    Kiwoom OpenAPI+ condition-based paper trading helper.
+    """Condition-search driven trading engine built on Kiwoom OpenAPI+.
+
+    The class encapsulates:
+
+    - Condition subscription (initial + real-time) and entry filtering.
+    - Order management with mid-price limit placement, automatic market
+      conversion, and split sizing when order-book depth is thin.
+    - Risk controls such as trading windows, instrument bans, volatility-aware
+      stop/target levels, trailing profits, and timeouts.
+    - Logging, chart capture, and adaptive feedback to help tune search formulas.
+
+    The behaviour of the engine is configured through :class:`OrderConfig`.
 
     References:
       - Kiwoom OpenAPI+ Developer Guide, Condition Search TR/Real API (2023-09-18)
@@ -130,10 +157,12 @@ class ConditionAutoTrader(QAxWidget):
         self.housekeeping_timer.timeout.connect(self._housekeeping)
 
     def _init_directories(self) -> None:
+        """Ensure log/chart directories exist before runtime files are written."""
         Path(self.config.log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.chart_dir).mkdir(parents=True, exist_ok=True)
 
     def _init_logger(self) -> None:
+        """Configure application-wide logging sinks (file + stdout)."""
         log_path = Path(self.config.log_dir) / "trader.log"
         logging.basicConfig(
             level=logging.INFO,
@@ -148,11 +177,13 @@ class ConditionAutoTrader(QAxWidget):
     # Login / basic helpers
     # ------------------------------------------------------------------ #
     def connect(self) -> None:
+        """Start the login process and block on the associated event loop."""
         self.dynamicCall("CommConnect()")
         self.login_event_loop = QEventLoop()
         self.login_event_loop.exec_()
 
     def _on_login(self, err_code: int) -> None:
+        """Handle login callback, start timers, and validate account config."""
         if err_code != 0:
             logging.error("Login failed: %s", err_code)
         else:
@@ -165,13 +196,16 @@ class ConditionAutoTrader(QAxWidget):
             self.login_event_loop.exit()
 
     def _get_accounts(self) -> Set[str]:
+        """Return the list of account numbers associated with the session."""
         raw = self.dynamicCall("GetLoginInfo(QString)", "ACCNO")
         return {acc.strip() for acc in raw.split(";") if acc.strip()}
 
     def set_input_value(self, key: str, value: str) -> None:
+        """Delegate to Kiwoom SetInputValue to configure TR parameters."""
         self.dynamicCall("SetInputValue(QString, QString)", key, value)
 
     def comm_rq_data(self, rqname: str, trcode: str, prev_next: str, screen_no: str) -> None:
+        """Send a TR request and block until the response event fires."""
         self.tr_event_loop = QEventLoop()
         self.dynamicCall(
             "CommRqData(QString, QString, int, QString)", rqname, trcode, int(prev_next), screen_no
@@ -187,6 +221,7 @@ class ConditionAutoTrader(QAxWidget):
         prev_next: str,
         *_,
     ) -> None:
+        """Generic TR callback used by helper fetches (daily/minute data)."""
         count = self.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
         rows = []
         for i in range(count):
@@ -207,6 +242,7 @@ class ConditionAutoTrader(QAxWidget):
             self.tr_event_loop.exit()
 
     def _comm_data(self, trcode: str, rqname: str, index: int, item: str) -> str:
+        """Fetch and strip a field from the most recent TR response cache."""
         value = self.dynamicCall(
             "GetCommData(QString, QString, int, QString)",
             trcode,
@@ -288,12 +324,14 @@ class ConditionAutoTrader(QAxWidget):
     # Condition callbacks
     # ------------------------------------------------------------------ #
     def _on_tr_condition(self, screen_no: str, code_list: str, condition_name: str, condition_index: int, *_):
+        """Process the initial batch of codes returned by SendCondition."""
         codes = [code for code in code_list.split(";") if code]
         logging.info("Initial condition matches (%s): %s", condition_name, codes)
         for code in codes:
             self._attempt_entry(code)
 
     def _on_real_condition(self, code: str, event_type: str, condition_name: str, condition_index: str) -> None:
+        """Handle real-time inclusion/exclusion events from condition search."""
         if event_type == "I":  # Enter
             logging.info("Condition IN: %s", code)
             self._attempt_entry(code)
@@ -301,13 +339,16 @@ class ConditionAutoTrader(QAxWidget):
             logging.info("Condition OUT: %s", code)
 
     def _attempt_entry(self, code: str) -> None:
+        """Apply gating rules and, if permitted, queue a new long position."""
         now = datetime.now()
+        # 장 시작 전/후 등 시간 조건 우선 확인
         if not self._is_within_trading_window(now):
             logging.debug("Outside trading window. Skipping %s", code)
             return
         if len(self.positions) >= self.config.max_positions:
             logging.info("Position limit reached; skipping %s", code)
             return
+        # 이미 보유 중이거나 주문이 진행 중인 경우는 제외
         if (
             code in self.positions
             or code in self.pending_entries
@@ -315,6 +356,7 @@ class ConditionAutoTrader(QAxWidget):
         ):
             logging.debug("Already holding or pending order for %s", code)
             return
+        # 지정된 재진입 금지 시간 또는 위험 관리 대상 여부 확인
         if not self._passes_block(code, now):
             logging.info("Code %s is blocked from re-entry.", code)
             return
@@ -334,6 +376,7 @@ class ConditionAutoTrader(QAxWidget):
         volatility_factor = self._compute_volatility_factor(code)
         take_profit, stop_loss = self._calculate_risk_levels(last_price, volatility_factor)
 
+        # 매수 수량 = (예산 / 가격)을 호가단위에 맞춰 보정
         quantity = max(int(budget // last_price), 0)
         quantity -= quantity % self.config.price_unit
 
@@ -341,6 +384,7 @@ class ConditionAutoTrader(QAxWidget):
             logging.warning("Computed quantity zero for %s", code)
             return
 
+        # 체결을 추적하기 위해 임시 버퍼에 목표 수량과 실행 금액을 저장
         self.pending_entries[code] = {
             "target_qty": quantity,
             "filled_qty": 0,
@@ -359,6 +403,7 @@ class ConditionAutoTrader(QAxWidget):
         self._place_entry_order(code, quantity, last_price)
 
     def _is_within_trading_window(self, now: datetime) -> bool:
+        """Check whether the current timestamp lies within the trading window."""
         start_hour, start_minute = map(int, self.config.trading_start.split(":"))
         end_hour, end_minute = map(int, self.config.trading_end.split(":"))
         start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
@@ -366,6 +411,7 @@ class ConditionAutoTrader(QAxWidget):
         return start <= now <= end
 
     def _passes_block(self, code: str, now: datetime) -> bool:
+        """True if the symbol is not currently in the re-entry cooldown window."""
         expiry = self.blocked_codes.get(code)
         if expiry is None:
             return True
@@ -375,6 +421,7 @@ class ConditionAutoTrader(QAxWidget):
         return False
 
     def _is_allowed_asset(self, code: str) -> bool:
+        """Return False for 관리·ETF·ETN·우선주·거래정지 등 위험 분류 종목."""
         name = self.dynamicCall("GetMasterCodeName(QString)", code)
         upper_name = name.upper() if name else ""
         if any(keyword.upper() in upper_name for keyword in self.config.banned_keywords):
@@ -422,6 +469,7 @@ class ConditionAutoTrader(QAxWidget):
         return take_profit, stop_loss
 
     def _place_entry_order(self, code: str, quantity: int, reference_price: float) -> None:
+        """Submit limit orders (possibly split) to start building the position."""
         self._ensure_real_subscription(code)
         asksize = int(self.orderbook[code].get("ask_size", quantity))
         if asksize > 0 and asksize < quantity:
@@ -438,6 +486,7 @@ class ConditionAutoTrader(QAxWidget):
             self._schedule_market_conversion(rqname)
 
     def _split_quantity(self, total: int, lot: int) -> List[int]:
+        """Return a list of child order sizes based on available depth."""
         if lot <= 0:
             return [total]
         parts = []
@@ -449,6 +498,7 @@ class ConditionAutoTrader(QAxWidget):
         return parts
 
     def _ensure_real_subscription(self, code: str) -> None:
+        """Register real-time feeds (체결/호가) for the specified ticker once."""
         if code in self.real_registered:
             return
         fid_list = "10;13;41;51;61;71"
@@ -456,6 +506,7 @@ class ConditionAutoTrader(QAxWidget):
         self.real_registered.add(code)
 
     def _mid_price(self, code: str, fallback: float) -> float:
+        """Calculate a fair mid-price using latest bid/ask with fallback."""
         ask = self.orderbook[code].get("ask")
         bid = self.orderbook[code].get("bid")
         if ask and bid:
@@ -463,6 +514,7 @@ class ConditionAutoTrader(QAxWidget):
         return self._adjust_price(fallback)
 
     def _adjust_price(self, price: float) -> float:
+        """Convert a raw price to the nearest legal tick size."""
         if price <= 0:
             return 0.0
         if price < 1000:
@@ -480,6 +532,7 @@ class ConditionAutoTrader(QAxWidget):
         return round(price / tick) * tick
 
     def _send_limit_order(self, rqname: str, order: OrderStatus) -> None:
+        """Submit a limit order (buy/sell) via SendOrder."""
         price = int(order.price)
         if price <= 0:
             price = 0
@@ -502,9 +555,11 @@ class ConditionAutoTrader(QAxWidget):
             logging.info("Limit order submitted %s %s qty=%s price=%s", order.order_type, order.code, order.quantity, price)
 
     def _schedule_market_conversion(self, rqname: str) -> None:
+        """Fallback to market execution if the limit has not filled."""
         QTimer.singleShot(3000, lambda: self._convert_to_market(rqname))
 
     def _convert_to_market(self, rqname: str) -> None:
+        """Cancel the resting limit order and submit the remainder at market."""
         order = self.pending_orders.get(rqname)
         if order is None:
             return
@@ -547,17 +602,20 @@ class ConditionAutoTrader(QAxWidget):
             logging.info("Market order submitted for remaining qty=%s of %s", order.remaining(), order.code)
 
     def _housekeeping(self) -> None:
+        """Periodic maintenance: release cooldowns, evaluate exits, prune orders."""
         now = datetime.now()
         self._cleanup_blocks(now)
         self._evaluate_positions(now)
         self._cleanup_orders(now)
 
     def _cleanup_blocks(self, now: datetime) -> None:
+        """Remove tickers from the blocked list once cooldown expires."""
         expired = [code for code, expiry in self.blocked_codes.items() if expiry <= now]
         for code in expired:
             self.blocked_codes.pop(code, None)
 
     def _cleanup_orders(self, now: datetime) -> None:
+        """Drop completed orders and reset pending-entry buffers if unused."""
         to_remove: List[Tuple[str, str]] = []
         for rqname, order in self.pending_orders.items():
             if order.remaining() <= 0 and (now - order.placed_at).total_seconds() > 5:
@@ -569,21 +627,25 @@ class ConditionAutoTrader(QAxWidget):
                 self.pending_entries.pop(code, None)
 
     def _evaluate_positions(self, now: datetime) -> None:
+        """Check each position against stop-loss, trailing, and timeout logic."""
         for code, position in list(self.positions.items()):
             price = self._current_price(code)
             if price <= 0:
                 continue
+            # 최신 체결가로 고점을 갱신하면 트레일링 조건 계산에 활용된다.
             position.update_high(price)
 
             if not position.reached_take_profit and price >= position.take_profit:
                 logging.info("Take-profit threshold reached for %s", code)
                 position.reached_take_profit = True
 
+            # 절대 손절 조건을 가장 먼저 평가한다.
             if price <= position.stop_loss:
                 logging.info("Stop loss triggered for %s", code)
                 self._initiate_exit(code, "stop_loss")
                 continue
 
+            # 익절 후 고점 대비 하락 폭이 크면 트레일링 손절을 발동한다.
             if position.reached_take_profit and position.trailing_stop_triggered(
                 price, self.config.trailing_drop_pct
             ):
@@ -591,11 +653,13 @@ class ConditionAutoTrader(QAxWidget):
                 self._initiate_exit(code, "trailing")
                 continue
 
+            # 설정된 보유 시간 초과 시 강제 청산.
             if now >= position.timeout_deadline:
                 logging.info("Timeout exit for %s", code)
                 self._initiate_exit(code, "timeout")
 
     def _current_price(self, code: str) -> float:
+        """Return the latest known price (real-time cache or master last price)."""
         price = self.orderbook[code].get("last")
         if price:
             return price
@@ -606,12 +670,14 @@ class ConditionAutoTrader(QAxWidget):
             return 0.0
 
     def _initiate_exit(self, code: str, reason: str) -> None:
+        """Prepare a sell order (possibly split) for the active position."""
         if code in self.exiting_codes:
             return
         position = self.positions.get(code)
         if position is None:
             return
         self.exiting_codes.add(code)
+        # 현재 호가 정보를 활용해 중간가(limit)를 산정한다.
         price = self._mid_price(code, position.high_price)
         quantity = position.quantity
         self.pending_exits[code] = {
@@ -620,8 +686,10 @@ class ConditionAutoTrader(QAxWidget):
             "executed_value": 0.0,
             "reason": reason,
         }
+        # 실시간 호가가 등록되어 있지 않으면 추가 등록
         self._ensure_real_subscription(code)
         bid_size = int(self.orderbook[code].get("bid_size", quantity))
+        # 매도 호가 잔량이 부족한 경우 분할 주문으로 나눈다.
         parts = self._split_quantity(quantity, bid_size)
         for idx, part in enumerate(parts):
             rqname = f"sell_{code}_{int(time.time())}_{idx}"
@@ -640,6 +708,7 @@ class ConditionAutoTrader(QAxWidget):
     # Order utilities
     # ------------------------------------------------------------------ #
     def _request_last_price(self, code: str) -> int:
+        """Return the master last price (used for quick budget calculations)."""
         price_str = self.dynamicCall("GetMasterLastPrice(QString)", code)
         try:
             return abs(int(price_str))
@@ -647,6 +716,7 @@ class ConditionAutoTrader(QAxWidget):
             return 0
 
     def _on_chejan(self, gubun: str, item_cnt: int, fid_list: str) -> None:
+        """React to order/position notifications (체결·미체결)."""
         parsed: Dict[str, str] = {}
         for fid in fid_list.split(";"):
             fid = fid.strip()
@@ -668,8 +738,10 @@ class ConditionAutoTrader(QAxWidget):
             if order.code != code:
                 continue
             if order.order_no is None and order_no:
+                # 주문 번호는 추후 정정/취소를 위해 저장
                 order.order_no = order_no
             if filled_qty > 0 and price > 0:
+                # 누적 체결 수량·금액을 기반으로 평균 체결가 산출
                 order.filled += filled_qty
                 order.executed_value += price * filled_qty
                 order.price = order.executed_value / order.filled if order.filled else price
@@ -695,6 +767,7 @@ class ConditionAutoTrader(QAxWidget):
                         self._finalize_exit(code)
 
     def _accumulate_entry(self, code: str, quantity: int, price: float) -> bool:
+        """Track partial fills for buy orders; return True when target met."""
         entry = self.pending_entries.get(code)
         if entry is None:
             return False
@@ -703,6 +776,7 @@ class ConditionAutoTrader(QAxWidget):
         return entry["filled_qty"] >= entry["target_qty"]
 
     def _accumulate_exit(self, code: str, quantity: int, price: float) -> bool:
+        """Track partial fills for sell orders; return True when exit complete."""
         exit_info = self.pending_exits.get(code)
         if exit_info is None:
             return False
@@ -711,6 +785,7 @@ class ConditionAutoTrader(QAxWidget):
         return exit_info["filled_qty"] >= exit_info["target_qty"]
 
     def _finalize_entry(self, code: str) -> None:
+        """Convert completed buy orders into a tracked :class:`PositionInfo`."""
         entry = self.pending_entries.pop(code, None)
         if entry is None:
             return
@@ -718,6 +793,7 @@ class ConditionAutoTrader(QAxWidget):
         if quantity <= 0:
             return
         executed_value = entry.get("executed_value", 0.0)
+        # 체결 금액 / 수량으로 평균 매수가를 계산 (잔여 체결 값이 없는 경우 현재가 사용)
         entry_price = executed_value / quantity if executed_value > 0 else self._current_price(code)
         volatility_factor = entry.get("volatility_factor", 1.0)
         take_profit, stop_loss = self._calculate_risk_levels(entry_price, volatility_factor)
@@ -744,6 +820,7 @@ class ConditionAutoTrader(QAxWidget):
         )
 
     def _finalize_exit(self, code: str) -> None:
+        """Wrap up a closed position: calculate PnL, log, and enforce cooldown."""
         exit_info = self.pending_exits.pop(code, None)
         position = self.positions.pop(code, None)
         self.exiting_codes.discard(code)
@@ -753,6 +830,7 @@ class ConditionAutoTrader(QAxWidget):
         if exit_info is not None and exit_info.get("filled_qty"):
             quantity = int(exit_info.get("filled_qty", quantity))
         executed_value = exit_info.get("executed_value", 0.0) if exit_info else 0.0
+        # 분할 청산의 평균 청산가를 계산 (없다면 현재가 사용)
         exit_price = executed_value / quantity if executed_value > 0 and quantity > 0 else self._current_price(code)
         pnl = (exit_price - position.entry_price) * position.quantity
         pnl_pct = (exit_price / position.entry_price - 1) if position.entry_price else 0
