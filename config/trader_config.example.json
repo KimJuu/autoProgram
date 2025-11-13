@@ -1,0 +1,26 @@
+{
+  "account_no": "1234567890",
+  "condition_index": 5,
+  "condition_name": "EnvelopeBreakout",
+  "screen_no": "2000",
+  "total_budget": 40000000,
+  "max_positions": 4,
+  "price_unit": 1,
+  "blocked_minutes": 60,
+  "trading_start": "09:20",
+  "trading_end": "15:15",
+  "profit_take_pct": 0.01,
+  "stop_loss_pct": 0.03,
+  "trailing_drop_pct": 0.01,
+  "timeout_minutes": 5,
+  "chart_minutes": 240,
+  "volatility_lookback": 20,
+  "volatility_buffer": 0.5,
+  "adaptive_enabled": true,
+  "banned_keywords": ["우", "ETF", "ETN", "스팩", "관리", "선물", "인버스"],
+  "per_symbol_budget": {
+    "005930": 12000000,
+    "000660": 10000000
+  }
+}
+
